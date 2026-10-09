@@ -1,0 +1,116 @@
+# Nombre que aparece en Actions
+name: CD main
+
+# Cuándo se ejecuta el workflow
+on:
+  # Al abrir o actualizar una PR hacia main
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+  # Cuando llegan cambios a main, también al mergear
+  push:
+    branches: [main]
+
+  # Para ejecutarlo a mano desde Actions
+  workflow_dispatch:
+
+# Permite subir el README modificado
+permissions:
+  contents: write
+
+# Evita que dos ejecuciones de CD escriban a la vez
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+jobs:
+  # Primer job: se ejecuta en los servidores de GitHub
+  update-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Descarga main para trabajar con sus archivos
+      - name: Descargar main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Actualizar versión y fecha
+        env:
+          EVENTO: ${{ github.event_name }}
+        run: |
+          # Busca la versión actual en el README
+          VERSION=$(grep -oE '^AppVersion-[0-9]+' README.md || true)
+
+          # Comprueba que haya una única línea de versión
+          if [ -z "$VERSION" ] || [ "$(printf '%s\n' "$VERSION" | wc -l)" -ne 1 ]; then
+            echo "ERROR: falta una única línea AppVersion-0 o similar en el README."
+            exit 1
+          fi
+
+          # Se queda con el número, quitando AppVersion-
+          NUMERO=${VERSION#AppVersion-}
+
+          # Suma uno a la versión actual
+          NUEVA_VERSION=$((10#$NUMERO + 1))
+
+          # Recoge la fecha y hora de España
+          FECHA=$(TZ=Europe/Madrid date '+%d/%m/%Y %H:%M:%S')
+
+          # Prepara el texto que se escribirá en el README
+          LINEA="AppVersion-$NUEVA_VERSION - $FECHA"
+
+          # En una PR solo muestra la versión prevista
+          if [ "$EVENTO" = "pull_request" ]; then
+            echo "Versión prevista tras el merge: $LINEA"
+          else
+            # Sustituye la línea de versión por la nueva
+            sed -i "s|^AppVersion-[0-9].*|$LINEA|" README.md
+            echo "README actualizado: $LINEA"
+          fi
+
+      - name: Guardar y subir el cambio
+        # Solo guarda la versión en un push o ejecución manual
+        if: github.event_name != 'pull_request'
+        run: |
+          # Identifica al autor del commit automático
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Guarda el cambio y lo sube a main
+          git add README.md
+          git commit -m "Actualiza versión y fecha desde CD"
+          git push origin main
+
+  # Segundo job: se ejecuta en mi PC
+  validate-prod:
+    # Espera a que el primer job termine correctamente
+    needs: update-version
+    runs-on: [self-hosted, Windows]
+
+    # Solo necesita permiso de lectura
+    permissions:
+      contents: read
+
+    steps:
+      - name: Comparar token de producción
+        shell: powershell
+        env:
+          # Recoge el secret de producción de GitHub
+          PROD_TOKEN: ${{ secrets.PROD_TOKEN }}
+        run: |
+          # Comprueba que existan el secret y la variable local
+          if ([string]::IsNullOrEmpty($env:PROD_TOKEN) -or
+              [string]::IsNullOrEmpty($env:LOCAL_PROD_TOKEN)) {
+            Write-Output "ERROR: falta el secret o la variable local de producción."
+            exit 1
+          }
+
+          # Compara los valores sin mostrarlos
+          if ($env:PROD_TOKEN -ceq $env:LOCAL_PROD_TOKEN) {
+            Write-Output "Correcto: los tokens de producción coinciden."
+          } else {
+            Write-Output "ERROR: los tokens de producción no coinciden."
+            exit 1
+          }

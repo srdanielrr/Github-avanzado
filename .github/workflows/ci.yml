@@ -1,0 +1,141 @@
+# Nombre del workflow
+name: CI develop
+
+# Cuándo se ejecuta el workflow
+on:
+  # Al abrir o actualizar una PR hacia develop
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened]
+
+  # Al subir cambios a develop, también al mergear
+  push:
+    branches: [develop]
+
+  # Para ejecutarlo a mano desde Actions
+  workflow_dispatch:
+
+# Permite escribir en el repositorio y consultar las PR
+permissions:
+  contents: write
+  pull-requests: read
+
+# Evita que dos ejecuciones de este CI se pisen
+concurrency:
+  group: ci-develop
+  cancel-in-progress: false
+
+jobs:
+  # Primer job: modifica el README en un servidor de GitHub
+  update-readme:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Descarga develop para trabajar con sus archivos
+      - name: Descargar develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - name: Añadir la feature al README
+        env:
+          # Token automático para consultar GitHub
+          GH_TOKEN: ${{ github.token }}
+
+          # Repositorio y evento que ha activado el workflow
+          REPOSITORIO: ${{ github.repository }}
+          EVENTO: ${{ github.event_name }}
+
+          # En una PR, head_ref contiene la rama de origen
+          RAMA_PR: ${{ github.head_ref }}
+
+          # En una PR usa el destino; en un push, la rama del push
+          RAMA_DESTINO: ${{ github.base_ref || github.ref_name }}
+
+          # Commit que ha activado esta ejecución
+          COMMIT: ${{ github.sha }}
+
+        run: |
+          # Al abrir o actualizar una PR, ya tenemos su origen
+          if [ "$EVENTO" = "pull_request" ]; then
+            RAMA_ORIGEN="$RAMA_PR"
+
+          # Después del merge, busca la PR asociada al commit
+          elif [ "$EVENTO" = "push" ]; then
+            RAMA_ORIGEN=$(gh api \
+              "repos/$REPOSITORIO/commits/$COMMIT/pulls" \
+              --jq ".[] | select(.base.ref == \"$RAMA_DESTINO\" and .merged_at != null and .merge_commit_sha == \"$COMMIT\") | .head.ref" \
+              | head -n 1)
+
+          # Si lo ejecuto a mano, no hay una PR concreta
+          else
+            RAMA_ORIGEN=""
+          fi
+
+          # Si no encuentra una feature, deja el README como está
+          if [ -z "$RAMA_ORIGEN" ]; then
+            echo "No hay una feature asociada a esta ejecución."
+            exit 0
+          fi
+
+          # Prepara la frase con la rama de origen y la de destino
+          LINEA="Añadida feature: $RAMA_ORIGEN a rama $RAMA_DESTINO"
+
+          # Solo añade la frase si todavía no está en el README
+          if ! grep -Fqx -- "$LINEA" README.md; then
+            printf '\n%s\n' "$LINEA" >> README.md
+          fi
+
+      - name: Guardar y subir el cambio
+        run: |
+          # Git necesita un nombre y correo para hacer el commit
+          # Uso el del bot para identificar el cambio automático
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Prepara el README para el commit
+          git add README.md
+
+          # Si no ha cambiado, no hace un commit vacío
+          if git diff --cached --quiet; then
+            echo "No hay cambios nuevos que guardar."
+          else
+            git commit -m "Añade feature al README desde CI"
+            git push origin develop
+          fi
+
+  # Segundo job: compara los tokens en mi PC
+  validate-dev:
+    # Espera a que update-readme termine correctamente
+    needs: update-readme
+
+    # Utiliza el runner de mi Windows
+    runs-on: [self-hosted, Windows]
+
+    # Este job no necesita escribir en el repositorio
+    permissions:
+      contents: read
+
+    steps:
+      - name: Comparar token de desarrollo
+        shell: powershell
+        env:
+          # Recoge el secret guardado en GitHub
+          DEV_TOKEN: ${{ secrets.DEV_TOKEN }}
+
+        run: |
+          # Comprueba que existan los dos valores
+          if ([string]::IsNullOrEmpty($env:DEV_TOKEN) -or
+              [string]::IsNullOrEmpty($env:LOCAL_DEV_TOKEN)) {
+            Write-Output "ERROR: falta el secret o la variable local."
+            exit 1
+          }
+
+          # Compara el secret con la variable de mi PC
+          # No muestra los valores y distingue las mayúsculas
+          if ($env:DEV_TOKEN -ceq $env:LOCAL_DEV_TOKEN) {
+            Write-Output "Correcto: los tokens coinciden."
+          } else {
+            Write-Output "ERROR: los tokens no coinciden."
+            exit 1
+          }
